@@ -44,7 +44,7 @@ fn current_usage(keychain: &dyn Keychain, accounts: &Accounts, cache: &Cache) ->
     if let Some(body) = cache.get("current") {
         return Ok(body);
     }
-    let (blob, _) = live_blob(keychain)?;
+    let blob = live_blob(keychain)?;
     let blob = ensure_fresh(keychain, accounts, blob, None)?;
     fetch_and_cache(cache, "current", &blob.oauth.access_token)
 }
@@ -55,7 +55,7 @@ fn run_all(keychain: &dyn Keychain, accounts: &Accounts, cache: &Cache, json: bo
     // The live login first, then each named backup.
     let live_subscription = live_blob(keychain)
         .ok()
-        .and_then(|(b, _)| b.oauth.subscription_type.clone());
+        .and_then(|b| b.oauth.subscription_type.clone());
     report(
         json,
         &mut out,
@@ -156,13 +156,12 @@ fn print_gauges(usage: &Usage, indent: &str) {
     }
 }
 
-/// Read the live Claude Code credentials. Returns the blob and the user name.
-pub fn live_blob(keychain: &dyn Keychain) -> Result<(CredentialBlob, String)> {
-    let user = current_user()?;
+/// Read the live Claude Code credentials.
+pub fn live_blob(keychain: &dyn Keychain) -> Result<CredentialBlob> {
     let raw = keychain
-        .read(CLAUDE_SERVICE, &user)?
+        .read(CLAUDE_SERVICE, &current_user()?)?
         .ok_or(tokache_core::Error::NoCredentials)?;
-    Ok((CredentialBlob::parse(&raw)?, user))
+    Ok(CredentialBlob::parse(&raw)?)
 }
 
 /// Refresh `blob` if its access token is expired, persisting to the copy it

@@ -61,8 +61,7 @@ fn accounts(keychain: &dyn Keychain, cmd: AccountsCmd) -> Result<()> {
     let accounts = Accounts::new(keychain, &data_dir);
     match cmd {
         AccountsCmd::Add { name } => {
-            let (blob, _) =
-                status::live_blob(keychain).context("capturing the current Claude login")?;
+            let blob = status::live_blob(keychain).context("capturing the current Claude login")?;
             let added_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             let meta = accounts.add(&name, &blob, &added_at)?;
             match meta.subscription_type {
