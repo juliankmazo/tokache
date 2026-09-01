@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::Result;
 
 /// One rate-limit window. `utilization` is a percentage (0–100).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct UsageWindow {
     pub utilization: f64,
     /// ISO 8601, may be absent.
@@ -15,7 +15,7 @@ pub struct UsageWindow {
 
 /// The windows we render. Anything else in the response (`extra_usage`, new
 /// fields) is ignored here but survives in `--json`, which prints the raw body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Usage {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,

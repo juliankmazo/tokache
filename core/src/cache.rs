@@ -38,7 +38,7 @@ impl Cache {
     }
 
     pub fn put(&self, key: &str, body: &str) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+        crate::create_private_dir(&self.dir)?;
         std::fs::write(self.path(key), body)?;
         Ok(())
     }

@@ -20,15 +20,11 @@ pub fn run(keychain: &dyn Keychain, json: bool, all: bool) -> Result<()> {
     if all {
         run_all(keychain, &accounts, &cache, json)
     } else {
-        let body = current_usage(keychain, &accounts, &cache).map_err(|e| {
-            if is_401(&e) {
-                e.context(
-                    "the usage endpoint rejected the token — re-authenticate with `claude /login`",
-                )
-            } else {
-                e
-            }
-        })?;
+        let body =
+            current_usage(keychain, &accounts, &cache).map_err(|e| match reauth_hint(&e) {
+                Some(hint) => e.context(hint),
+                None => e,
+            })?;
         if json {
             println!("{body}");
         } else {
@@ -52,15 +48,13 @@ fn current_usage(keychain: &dyn Keychain, accounts: &Accounts, cache: &Cache) ->
 fn run_all(keychain: &dyn Keychain, accounts: &Accounts, cache: &Cache, json: bool) -> Result<()> {
     let mut out = serde_json::Map::new();
 
-    // The live login first, then each named backup.
-    let live_subscription = live_blob(keychain)
-        .ok()
-        .and_then(|b| b.oauth.subscription_type.clone());
+    // The live login first, then each named backup. No eager keychain read
+    // just for a label — a fresh cache hit must stay prompt-free.
     report(
         json,
         &mut out,
         "current",
-        live_subscription.as_deref(),
+        None,
         current_usage(keychain, accounts, cache),
     );
 
@@ -121,13 +115,13 @@ fn report(
             if json {
                 out.insert(
                     name.to_string(),
-                    serde_json::json!({ "stale": true, "error": e.to_string() }),
+                    serde_json::json!({ "stale": true, "error": format!("{e:#}") }),
                 );
             } else {
-                println!("{name}: stale — {e}");
+                println!("{name}: stale — {e:#}");
                 if name == "current" {
-                    if is_401(&e) {
-                        println!("  (re-authenticate with `claude /login`)");
+                    if let Some(hint) = reauth_hint(&e) {
+                        println!("  ({hint})");
                     }
                 } else {
                     println!("  (re-capture with `tokache accounts remove {name} && tokache accounts add {name}`)");
@@ -137,12 +131,22 @@ fn report(
     }
 }
 
-/// Was this a 401 from the usage endpoint (token no longer accepted)?
-fn is_401(e: &anyhow::Error) -> bool {
-    matches!(
-        e.downcast_ref::<tokache_core::Error>(),
-        Some(tokache_core::Error::Http { status: 401, .. })
-    )
+/// An actionable hint when the failure means the credential itself is dead.
+/// A usage-endpoint 401 is a rejected access token; a token-endpoint 400/401
+/// is the invalid_grant case — the stored refresh token is no longer valid.
+fn reauth_hint(e: &anyhow::Error) -> Option<&'static str> {
+    use tokache_core::Error::Http;
+    match e.downcast_ref::<tokache_core::Error>() {
+        Some(Http {
+            endpoint: "usage",
+            status: 401,
+        }) => Some("re-authenticate with `claude /login`"),
+        Some(Http {
+            endpoint: "token",
+            status: 400 | 401,
+        }) => Some("refresh token no longer valid — re-capture the account or run `claude /login`"),
+        _ => None,
+    }
 }
 
 fn print_gauges(usage: &Usage, indent: &str) {
@@ -186,15 +190,24 @@ fn ensure_fresh(
         Some(name) => accounts.write_blob(name, &updated),
         None => keychain.write(CLAUDE_SERVICE, &user, &updated.to_json()?),
     }
-    .context("writing refreshed credentials back")?;
-    accounts
-        .sync_rotated(&user, &old_refresh, &fresh, backup_name)
-        .context("syncing rotated credentials to other stored copies")?;
+    .context(
+        "token was refreshed but the new credentials could NOT be saved to the keychain — \
+         the old refresh token is now invalid server-side; if this account stops working, \
+         re-authenticate with `claude /login`",
+    )?;
+    // Best-effort: the refresh already succeeded, so sync problems are
+    // warnings, never a failure of this account.
+    for warning in accounts.sync_rotated(&user, &old_refresh, &fresh, backup_name) {
+        eprintln!("warning: rotated refresh token not synced to {warning}");
+    }
     Ok(updated)
 }
 
 fn fetch_and_cache(cache: &Cache, key: &str, access_token: &str) -> Result<String> {
     let body = net::fetch_usage(access_token)?;
-    cache.put(key, &body)?;
+    // A failed cache write must not throw away a good response.
+    if let Err(e) = cache.put(key, &body) {
+        eprintln!("warning: could not cache the usage response: {e}");
+    }
     Ok(body)
 }

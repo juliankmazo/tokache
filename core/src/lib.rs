@@ -23,6 +23,16 @@ pub fn data_dir() -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(home).join("Library/Application Support/tokache"))
 }
 
+/// Create `dir` (and any parents) with owner-only (0700) permissions.
+/// The store holds account names and cached usage — non-secret, but private.
+pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 /// Current epoch time in milliseconds (the unit `expiresAt` uses).
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()

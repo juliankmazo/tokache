@@ -28,6 +28,12 @@ pub enum Error {
     #[error("account name {0:?} is invalid (use 1-64 chars: letters, digits, '.', '_', '-')")]
     BadAccountName(String),
 
+    #[error("account name {0:?} is reserved for the live login")]
+    ReservedName(String),
+
+    #[error("token endpoint returned an unusable response: {0}")]
+    BadTokenResponse(String),
+
     #[error("account '{0}' already exists (remove it first to re-capture)")]
     AccountExists(String),
 

@@ -69,6 +69,12 @@ pub fn refresh(oauth: &ClaudeOauth, now_ms: i64) -> Result<ClaudeOauth> {
         .send_string(&body.to_string())
         .map_err(map_err("token"))?;
     let token: TokenResponse = serde_json::from_str(&resp.into_string()?)?;
+    if token.access_token.is_empty() || token.expires_in <= 0 {
+        // Never persist garbage over a still-working credential set.
+        return Err(Error::BadTokenResponse(
+            "empty access_token or non-positive expires_in".into(),
+        ));
+    }
 
     let mut fresh = oauth.clone();
     fresh.access_token = token.access_token;
