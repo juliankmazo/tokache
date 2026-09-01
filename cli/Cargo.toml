@@ -1,0 +1,18 @@
+[package]
+name = "tokache-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tokache: track Claude usage limits across accounts"
+
+[[bin]]
+name = "tokache"
+path = "src/main.rs"
+
+[dependencies]
+tokache-core = { path = "../core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono.workspace = true
+serde_json.workspace = true

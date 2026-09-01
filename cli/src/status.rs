@@ -1,0 +1,213 @@
+//! `tokache status`: fetch (with cache + transparent token refresh) and render.
+
+use std::io::IsTerminal;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use tokache_core::accounts::Accounts;
+use tokache_core::cache::{Cache, DEFAULT_TTL};
+use tokache_core::credentials::CredentialBlob;
+use tokache_core::keychain::{current_user, Keychain, CLAUDE_SERVICE};
+use tokache_core::usage::Usage;
+use tokache_core::{net, now_ms};
+
+use crate::render;
+
+pub fn run(keychain: &dyn Keychain, json: bool, all: bool) -> Result<()> {
+    let data_dir = tokache_core::data_dir()?;
+    let cache = Cache::new(&data_dir, DEFAULT_TTL);
+    let accounts = Accounts::new(keychain, &data_dir);
+    if all {
+        run_all(keychain, &accounts, &cache, json)
+    } else {
+        let body =
+            current_usage(keychain, &accounts, &cache).map_err(|e| match reauth_hint(&e) {
+                Some(hint) => e.context(hint),
+                None => e,
+            })?;
+        if json {
+            println!("{body}");
+        } else {
+            print_gauges(&Usage::parse(&body)?, "");
+        }
+        Ok(())
+    }
+}
+
+/// Usage body for the live login, refreshing the keychain item if expired.
+/// A fresh cache hit never touches the keychain (no consent prompt).
+fn current_usage(keychain: &dyn Keychain, accounts: &Accounts, cache: &Cache) -> Result<String> {
+    if let Some(body) = cache.get("current") {
+        return Ok(body);
+    }
+    let blob = live_blob(keychain)?;
+    let blob = ensure_fresh(keychain, accounts, blob, None)?;
+    fetch_and_cache(cache, "current", &blob.oauth.access_token)
+}
+
+fn run_all(keychain: &dyn Keychain, accounts: &Accounts, cache: &Cache, json: bool) -> Result<()> {
+    let mut out = serde_json::Map::new();
+
+    // The live login first, then each named backup. No eager keychain read
+    // just for a label — a fresh cache hit must stay prompt-free.
+    report(
+        json,
+        &mut out,
+        "current",
+        None,
+        current_usage(keychain, accounts, cache),
+    );
+
+    for meta in accounts.list().context("reading the account index")? {
+        let result = (|| {
+            if let Some(body) = cache.get(&meta.name) {
+                return Ok(body);
+            }
+            let blob = accounts.read_blob(&meta.name)?;
+            let blob = ensure_fresh(keychain, accounts, blob, Some(&meta.name))?;
+            fetch_and_cache(cache, &meta.name, &blob.oauth.access_token)
+        })();
+        report(
+            json,
+            &mut out,
+            &meta.name,
+            meta.subscription_type.as_deref(),
+            result,
+        );
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(out))?
+        );
+    }
+    Ok(())
+}
+
+/// Render (or collect, for --json) one account's outcome. Errors mark the
+/// account stale rather than aborting the sweep.
+fn report(
+    json: bool,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    subscription: Option<&str>,
+    result: Result<String>,
+) {
+    match result {
+        Ok(body) => {
+            if json {
+                let value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| serde_json::Value::String(body));
+                out.insert(name.to_string(), value);
+            } else {
+                match subscription {
+                    Some(sub) => println!("{name} ({sub})"),
+                    None => println!("{name}"),
+                }
+                match Usage::parse(&body) {
+                    Ok(usage) => print_gauges(&usage, "  "),
+                    Err(e) => println!("  unreadable response: {e}"),
+                }
+            }
+        }
+        Err(e) => {
+            if json {
+                out.insert(
+                    name.to_string(),
+                    serde_json::json!({ "stale": true, "error": format!("{e:#}") }),
+                );
+            } else {
+                println!("{name}: stale — {e:#}");
+                if name == "current" {
+                    if let Some(hint) = reauth_hint(&e) {
+                        println!("  ({hint})");
+                    }
+                } else {
+                    println!("  (re-capture with `tokache accounts remove {name} && tokache accounts add {name}`)");
+                }
+            }
+        }
+    }
+}
+
+/// An actionable hint when the failure means the credential itself is dead.
+/// A usage-endpoint 401 is a rejected access token; a token-endpoint 400/401
+/// is the invalid_grant case — the stored refresh token is no longer valid.
+fn reauth_hint(e: &anyhow::Error) -> Option<&'static str> {
+    use tokache_core::Error::Http;
+    match e.downcast_ref::<tokache_core::Error>() {
+        Some(Http {
+            endpoint: "usage",
+            status: 401,
+        }) => Some("re-authenticate with `claude /login`"),
+        Some(Http {
+            endpoint: "token",
+            status: 400 | 401,
+        }) => Some("refresh token no longer valid — re-capture the account or run `claude /login`"),
+        _ => None,
+    }
+}
+
+fn print_gauges(usage: &Usage, indent: &str) {
+    let color = std::io::stdout().is_terminal();
+    let lines = render::gauges(usage, Utc::now(), color);
+    if lines.is_empty() {
+        println!("{indent}no rate-limit windows reported");
+    }
+    for line in lines {
+        println!("{indent}{line}");
+    }
+}
+
+/// Read the live Claude Code credentials.
+pub fn live_blob(keychain: &dyn Keychain) -> Result<CredentialBlob> {
+    let raw = keychain
+        .read(CLAUDE_SERVICE, &current_user()?)?
+        .ok_or(tokache_core::Error::NoCredentials)?;
+    Ok(CredentialBlob::parse(&raw)?)
+}
+
+/// Refresh `blob` if its access token is expired, persisting to the copy it
+/// came from (`backup_name`, or the live Claude Code item for `None`) and
+/// then syncing every other stored copy that held the same rotated refresh
+/// token — right after `accounts add`, live and backup share one, and a
+/// rotation persisted to only one copy would strand the other.
+fn ensure_fresh(
+    keychain: &dyn Keychain,
+    accounts: &Accounts,
+    blob: CredentialBlob,
+    backup_name: Option<&str>,
+) -> Result<CredentialBlob> {
+    if !blob.oauth.is_expired_at(now_ms()) {
+        return Ok(blob);
+    }
+    let old_refresh = blob.oauth.refresh_token.clone();
+    let fresh = net::refresh(&blob.oauth, now_ms()).context("refreshing expired access token")?;
+    let updated = blob.with_oauth(fresh.clone())?;
+    let user = current_user()?;
+    match backup_name {
+        Some(name) => accounts.write_blob(name, &updated),
+        None => keychain.write(CLAUDE_SERVICE, &user, &updated.to_json()?),
+    }
+    .context(
+        "token was refreshed but the new credentials could NOT be saved to the keychain — \
+         the old refresh token is now invalid server-side; if this account stops working, \
+         re-authenticate with `claude /login`",
+    )?;
+    // Best-effort: the refresh already succeeded, so sync problems are
+    // warnings, never a failure of this account.
+    for warning in accounts.sync_rotated(&user, &old_refresh, &fresh, backup_name) {
+        eprintln!("warning: rotated refresh token not synced to {warning}");
+    }
+    Ok(updated)
+}
+
+fn fetch_and_cache(cache: &Cache, key: &str, access_token: &str) -> Result<String> {
+    let body = net::fetch_usage(access_token)?;
+    // A failed cache write must not throw away a good response.
+    if let Err(e) = cache.put(key, &body) {
+        eprintln!("warning: could not cache the usage response: {e}");
+    }
+    Ok(body)
+}

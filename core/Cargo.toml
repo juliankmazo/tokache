@@ -1,0 +1,17 @@
+[package]
+name = "tokache-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core library for tokache: Claude credential handling and usage polling"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
