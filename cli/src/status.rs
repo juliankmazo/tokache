@@ -30,7 +30,11 @@ pub fn run(keychain: &dyn Keychain, json: bool, all: bool) -> Result<()> {
 }
 
 /// Usage body for the live login, refreshing the keychain item if expired.
+/// A fresh cache hit never touches the keychain (no consent prompt).
 fn current_usage(keychain: &dyn Keychain, cache: &Cache) -> Result<String> {
+    if let Some(body) = cache.get("current") {
+        return Ok(body);
+    }
     let (blob, _) = live_blob(keychain)?;
     let blob = ensure_fresh(blob, |b| {
         let user = current_user()?;
@@ -62,6 +66,9 @@ fn run_all(
 
     for meta in accounts.list().context("reading the account index")? {
         let result = (|| {
+            if let Some(body) = cache.get(&meta.name) {
+                return Ok(body);
+            }
             let blob = accounts.read_blob(&meta.name)?;
             // Refresh against the *backup* item; rotation must be persisted
             // or the stored refresh token dies.
