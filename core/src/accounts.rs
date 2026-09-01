@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::credentials::CredentialBlob;
-use crate::keychain::{Keychain, TOKACHE_SERVICE};
+use crate::credentials::{ClaudeOauth, CredentialBlob};
+use crate::keychain::{Keychain, CLAUDE_SERVICE, TOKACHE_SERVICE};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +85,46 @@ impl<'k> Accounts<'k> {
     /// Overwrite a backup's blob (e.g. after a token refresh rotated it).
     pub fn write_blob(&self, name: &str, blob: &CredentialBlob) -> Result<()> {
         self.keychain.write(TOKACHE_SERVICE, name, &blob.to_json()?)
+    }
+
+    /// After a refresh rotated credentials, bring every *other* stored copy
+    /// that still holds the pre-refresh refresh token up to date: the live
+    /// Claude Code item (account `live_user`) and all named backups. Right
+    /// after `accounts add`, live and backup share one refresh token, so a
+    /// rotation persisted to only one copy would strand the other with a
+    /// dead token (→ forced `/login`).
+    ///
+    /// `already_updated` is the copy the refresh was written to: a backup
+    /// name, or `None` for the live item.
+    pub fn sync_rotated(
+        &self,
+        live_user: &str,
+        old_refresh_token: &str,
+        fresh: &ClaudeOauth,
+        already_updated: Option<&str>,
+    ) -> Result<()> {
+        if already_updated.is_some() {
+            if let Some(raw) = self.keychain.read(CLAUDE_SERVICE, live_user)? {
+                if let Ok(blob) = CredentialBlob::parse(&raw) {
+                    if blob.oauth.refresh_token == old_refresh_token {
+                        let updated = blob.with_oauth(fresh.clone())?;
+                        self.keychain
+                            .write(CLAUDE_SERVICE, live_user, &updated.to_json()?)?;
+                    }
+                }
+            }
+        }
+        for meta in self.list()? {
+            if Some(meta.name.as_str()) == already_updated {
+                continue;
+            }
+            if let Ok(blob) = self.read_blob(&meta.name) {
+                if blob.oauth.refresh_token == old_refresh_token {
+                    self.write_blob(&meta.name, &blob.with_oauth(fresh.clone())?)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn load(&self) -> Result<Index> {
@@ -216,6 +256,85 @@ mod tests {
             accounts.remove("nope"),
             Err(Error::AccountNotFound(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn blob_with_refresh(rt: &str) -> CredentialBlob {
+        CredentialBlob::parse(&format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at-{rt}","refreshToken":"{rt}",
+                "expiresAt":1750000000000,"scopes":["user:inference"],
+                "subscriptionType":"max"}},"mcpOAuth":{{"srv":{{"t":"opaque"}}}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn sync_rotated_updates_every_copy_sharing_the_old_token() {
+        let kc = MemKeychain::new();
+        let dir = temp_dir("sync");
+        let accounts = Accounts::new(&kc, &dir);
+
+        // Live login and the "shared" backup hold the same refresh token
+        // (the state right after `accounts add`); "other" does not.
+        let shared = blob_with_refresh("rt-shared");
+        kc.write(CLAUDE_SERVICE, "julian", &shared.to_json().unwrap())
+            .unwrap();
+        accounts
+            .add("shared", &shared, "2026-08-31T12:00:00Z")
+            .unwrap();
+        accounts
+            .add(
+                "other",
+                &blob_with_refresh("rt-other"),
+                "2026-08-31T12:00:00Z",
+            )
+            .unwrap();
+
+        // A refresh of the "shared" backup rotated the token. The caller
+        // writes the refreshed copy itself, then syncs the rest.
+        let mut fresh = shared.oauth.clone();
+        fresh.access_token = "at-new".into();
+        fresh.refresh_token = "rt-new".into();
+        fresh.expires_at = 1750009999000;
+        accounts
+            .write_blob("shared", &shared.with_oauth(fresh.clone()).unwrap())
+            .unwrap();
+        accounts
+            .sync_rotated("julian", "rt-shared", &fresh, Some("shared"))
+            .unwrap();
+
+        // The live item caught up (and kept its mcpOAuth).
+        let live = kc.read(CLAUDE_SERVICE, "julian").unwrap().unwrap();
+        let live = CredentialBlob::parse(&live).unwrap();
+        assert_eq!(live.oauth.refresh_token, "rt-new");
+        assert_eq!(live.oauth.access_token, "at-new");
+        assert!(live.to_json().unwrap().contains("mcpOAuth"));
+
+        // The unrelated backup is untouched.
+        let other = accounts.read_blob("other").unwrap();
+        assert_eq!(other.oauth.refresh_token, "rt-other");
+
+        // Mirror case: a refresh of the *live* login syncs backups.
+        let mut fresh2 = fresh.clone();
+        fresh2.refresh_token = "rt-newer".into();
+        accounts
+            .sync_rotated("julian", "rt-new", &fresh2, None)
+            .unwrap();
+        assert_eq!(
+            accounts.read_blob("shared").unwrap().oauth.refresh_token,
+            "rt-newer"
+        );
+        assert_eq!(
+            accounts.read_blob("other").unwrap().oauth.refresh_token,
+            "rt-other"
+        );
+        // `None` means the live item was already written by the caller.
+        let live = kc.read(CLAUDE_SERVICE, "julian").unwrap().unwrap();
+        assert_eq!(
+            CredentialBlob::parse(&live).unwrap().oauth.refresh_token,
+            "rt-new"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
