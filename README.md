@@ -40,4 +40,7 @@ but it relies on an undocumented endpoint: use at your own judgment.
 
 ## License
 
-MIT
+[FSL-1.1-MIT](LICENSE) (Fair Source). Free to use, modify, and share for any
+purpose except offering tokache as a competing commercial product or service —
+that requires a license from me. Each version becomes plain MIT two years
+after release.
